@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <stdint.h>
+#include <time.h>
 
 #define WDT_OFFSET 0x2004c000
 #define CRU_OFFSET 0x20000000
@@ -56,84 +57,89 @@
 #define WDT_CRR (WDT_OFFSET + 0x0c)
 #define WDT_CRR__VALUE 0x76
 
-static int   *mem_32 = 0;
-static short *mem_16 = 0;
-static char  *mem_8  = 0;
+static uint32_t *mem_32 = 0;
 static int   *prev_mem_range = 0;
 
-static int read_kernel_memory(long offset, int virtualized, int size) {
+extern void sys_exit(int code);
+extern int sys_write(int fd, const void *buf, int count);
+extern int sys_open(const char *pathname, int flags);
+extern int sys_close(int fd);
+extern void *sys_mmap(void *addr, size_t length, int prot, int flags,
+                      int fd, off_t offset);
+extern void *sys_mmap2(void *addr, size_t length, int prot, int flags,
+                       int fd, off_t offset);
+extern int sys_munmap(void *addr, size_t length);
+extern int sys_nanosleep(const struct timespec *req, struct timespec *rem);
+
+static int _strlen(const char *s) {
+    int len = 0;
+    while (*s++)
+        len++;
+    return len;
+}
+
+static void _puts(const char *s) {
+    sys_write(1, s, _strlen(s));
+    sys_write(1, "\n", 1);
+}
+
+static void _perror(const char *s) {
+    sys_write(2, s, _strlen(s));
+    sys_write(2, "\n", 1);
+}
+
+static void _sleep(int secs) {
+    struct timespec sleepsecs = {
+        .tv_sec = secs,
+        .tv_nsec = 0,
+    };
+    sys_nanosleep(&sleepsecs, NULL);
+}
+
+static int readl(long offset) {
     int result;
     static int mem_fd;
 
     int *mem_range = (int *)(offset & ~0xFFFF);
-    if( mem_range != prev_mem_range ) {
+    if (mem_range != prev_mem_range) {
         prev_mem_range = mem_range;
 
-        if(mem_32)
-            munmap(mem_32, 0xFFFF);
-        if(mem_fd)
-            close(mem_fd);
+        if (mem_32)
+            sys_munmap(mem_32, 0xFFFF);
+        if (mem_fd)
+            sys_close(mem_fd);
 
-        if(virtualized) {
-            mem_fd = open("/dev/kmem", O_RDWR);
-            if( mem_fd < 0 ) {
-                perror("Unable to open /dev/kmem");
-                mem_fd = 0;
-                return -1;
-            }
-        }
-        else {
-            mem_fd = open("/dev/mem", O_RDWR);
-            if( mem_fd < 0 ) {
-                perror("Unable to open /dev/mem");
-                mem_fd = 0;
-                return -1;
-            }
-        }
-
-        mem_32 = mmap(0, 0xffff, PROT_READ | PROT_WRITE, MAP_SHARED, mem_fd, offset&~0xFFFF);
-        if( -1 == (int)mem_32 ) {
-            perror("Unable to mmap file");
-
-            if( -1 == close(mem_fd) )
-                perror("Also couldn't close file");
-
-            mem_fd=0;
+        mem_fd = sys_open("/dev/mem", O_RDWR);
+        if (mem_fd < 0) {
+            _perror("Unable to open /dev/mem");
+            mem_fd = 0;
             return -1;
         }
-        mem_16 = (short *)mem_32;
-        mem_8  = (char  *)mem_32;
+
+        mem_32 = sys_mmap2(0, 0xffff, PROT_READ | PROT_WRITE, MAP_SHARED, mem_fd, (offset&~0xFFFF) / 4096);
+        //mem_32 = mmap(0, 0xffff, PROT_READ | PROT_WRITE, MAP_SHARED, mem_fd, (offset&~0xFFFF));
+        if( -1 == (int)mem_32 ) {
+            _perror("Unable to mmap file");
+
+            if( -1 == sys_close(mem_fd) )
+                _perror("Also couldn't close file");
+
+            mem_fd = 0;
+            return -1;
+        }
     }
 
     int scaled_offset = (offset-(offset&~0xFFFF));
-    if(size==1)
-        result = mem_8[scaled_offset/sizeof(char)];
-    else if(size==2)
-        result = mem_16[scaled_offset/sizeof(short)];
-    else
-        result = mem_32[scaled_offset/sizeof(long)];
+    result = mem_32[scaled_offset/sizeof(long)];
 
     return result;
 }
 
-static int write_kernel_memory(long offset, long value, int virtualized, int size) {
-    int old_value = read_kernel_memory(offset, virtualized, size);
+static int writel(long value, long offset) {
+    int old_value = readl(offset);
     int scaled_offset = (offset-(offset&~0xFFFF));
-    if(size==1)
-        mem_8[scaled_offset/sizeof(char)]   = value;
-    else if(size==2)
-        mem_16[scaled_offset/sizeof(short)] = value;
-    else
-        mem_32[scaled_offset/sizeof(long)]  = value;
+    mem_32[scaled_offset/sizeof(long)]  = value;
     return old_value;
-}
-
-static int writel(uint32_t value, uint32_t addr) {
-    return write_kernel_memory(addr, value, 0, 4);
-}
-
-static int readl(uint32_t addr) {
-    return read_kernel_memory(addr, 0, 4);
 }
 
 static void kick_wdt(void) {
@@ -166,16 +172,18 @@ static void enable_wdt(void) {
     return;
 }
 
-int main(int argc, char **argv) {
+//int main(int argc, char **argv) {
+int _start(void) {
 
+    _puts("Enabling WDT...");
     enable_wdt();
 
-    puts("Resetting the WDT every 15 seconds.");
-    puts("If you stop this program, the system will reset within 28 seconds!");
+    _puts("Done.  Will reset the WDT every 15 seconds.");
+    _puts("If you stop this program, the system will reset within 28 seconds!");
     while (1) {
-        sleep(15);
+        _sleep(15);
         kick_wdt();
     }
 
-    return 0;
+    sys_exit(0);
 }
